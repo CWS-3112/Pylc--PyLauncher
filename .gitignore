@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.smoke-home/
+config.json
+accounts.json
+*.part
+*.json.bak
+*.json.tmp
+.pylauncher/
+
+# 运行时生成 / 开发调试产物
+.shots/
+.icon-preview/
+.selftest.log
+logs/
+icons/
+
+# 临时诊断脚本
+.probe_*.py
+.verify_*.py
+
+# 临时诊断脚本
+.probe_*.py
+.verify_*.py
