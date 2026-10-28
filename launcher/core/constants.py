@@ -11,7 +11,7 @@ from typing import Dict
 # ---------------------------------------------------------------- 启动器信息
 
 LAUNCHER_NAME = "PyLauncher"
-LAUNCHER_VERSION = "1.1.0"
+LAUNCHER_VERSION = "1.0.0"
 LAUNCHER_BRAND = "pylauncher"
 
 # ---------------------------------------------------------------- 下载源

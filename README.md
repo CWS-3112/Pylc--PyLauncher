@@ -1,7 +1,7 @@
 # PyLauncher
 
 一个功能对标 HMCL（Hello Minecraft! Launcher）的《我的世界》**Java 版**启动器，  
-使用 **Python + PySide6** 编写，跨 Windows / macOS / Linux。当前版本 **1.1.0**。
+使用 **Python + PySide6** 编写，跨 Windows / macOS / Linux。当前版本 **1.0.0**。
 
 代码按「核心层 / 界面层」严格分离，`launcher/core` 不依赖任何 GUI 组件，  
 可以单独被命令行工具或测试脚本调用。
@@ -16,10 +16,21 @@
 | Java 环境 | 自动扫描注册表、`JAVA_HOME`、`PATH`、各发行版默认目录；真实执行 `java -version` 解析版本号与位数；按版本需求（1.17→16、1.18→17、1.20.5→21）择优；支持手动指定           |
 | 账户      | **离线登录**（按 `OfflinePlayer:` 规则生成确定性 UUID）；**微软正版登录**（完整设备码流程：Device Code → XBL → XSTS → Minecraft → 角色信息，支持刷新令牌）      |
 | 加载器     | **Fabric** 由本启动器自行组装版本 JSON 并下载其库；**Forge** 调用官方 Installer（`--installClient`），失败时回退为解包安装                              |
-| Mod 管理  | 扫描实例 `mods` 目录；解析 `fabric.mod.json` / `META-INF/mods.toml` / `mcmod.info`；启用 / 禁用（`.jar.disabled`）、导入、删除、批量切换         |
+| Mod 管理  | 扫描实例 `mods` 目录；解析 `fabric.mod.json` / `META-INF/mods.toml` / `mcmod.info`；启用 / 禁用（`.jar.disabled`）、导入、删除、批量切换；**内置 Modrinth 在线模组库，搜索后一键下载安装**   |
 | 启动      | 完整实现 Mojang 参数规范：`inheritsFrom` 继承链合并、rules 求值、占位符替换、classpath 与 natives 拼装、内存/窗口/包装命令/自定义 JVM 与游戏参数；实时日志窗口、进程托管与强制结束 |
 | 多版本隔离   | 每个版本可有独立实例目录（`isolates/<id>` 存放存档、Mod、配置、options.txt），也可共用公共目录；实例可单独指定 Java、内存、分辨率与参数                                 |
 | 持久化     | 配置、实例、账户全部落盘为 JSON，写入即保存；文件损坏时自动备份并回退默认值                                                                              |
+| 材质包/光影 | 按实例扫描 `resourcepacks` / `shaderpacks`，启用 / 禁用 / 删除 / 本地导入，同样支持从 Modrinth 在线安装                                                    |
+| 服务器联机 | 服务器列表持久化 + Server List Ping（MOTD / 人数 / 延迟 / 版本）；**局域网组播发现**（224.0.2.60:4445）；**跨网联机**：联机码 + 内置 TCP 中继（带口令鉴权）          |
+| 加载性能   | 分页懒加载（首屏只建首页，构造 846ms→13ms）、Java 探测后台化与缓存（设置页 681ms→17ms）、版本清单**缓存秒开 + 后台静默刷新**（15ms 出列表）、多源**并发**取最快响应、渲染去重（脏标记 + 0.5s 节流） |
+| 稳定性     | 动画层可中断无残留（快照叠加层复用、控件不会被留在透明状态）；退出时统一收尾后台线程与 IO 线程池；分页懒加载 + 渲染节流，连续切换不涨内存 |
+| 稳定性     | 动画层可中断无残留（快照叠加层复用、控件不会被留在透明状态）；退出时统一收尾后台线程与 IO 线程池；分页懒加载 + 渲染节流，连续切换不涨内存 |
+| 加载兜底   | 所有列表都有「加载中」占位；版本列表失败时给出原因 + 「重试」按钮，有缓存时优先显示缓存并标注「离线缓存」，绝不出现无反馈白屏                     |
+| 加载性能   | 分页懒加载（首屏只建首页，构造 846ms→13ms）、Java 探测后台化与缓存（设置页 681ms→17ms）、版本清单**缓存秒开 + 后台静默刷新**（15ms 出列表）、多源**并发**取最快响应、渲染去重（脏标记 + 0.5s 节流） |
+| 稳定性     | 动画层可中断无残留（快照叠加层复用、控件不会被留在透明状态）；退出时统一收尾后台线程与 IO 线程池；分页懒加载 + 渲染节流，连续切换不涨内存 |
+| 稳定性     | 动画层可中断无残留（快照叠加层复用、控件不会被留在透明状态）；退出时统一收尾后台线程与 IO 线程池；分页懒加载 + 渲染节流，连续切换不涨内存 |
+| 加载兜底   | 所有列表都有「加载中」占位；版本列表失败时给出原因 + 「重试」按钮，有缓存时优先显示缓存并标注「离线缓存」，绝不出现无反馈白屏                     |
+| 安全防火墙 | 出站域名白名单、强制 HTTPS、SSRF（内网地址）拦截；下载目标限制在游戏目录内；解压拦截 zip slip、符号链接与压缩包炸弹；单文件体积上限                          |
 | 下载源     | 官方源与 BMCLAPI 镜像一键切换；**主源失败自动回退备用源**，安装前还会先做源健康检查并自动切到当前真能连通的那个（清单、版本 JSON、JAR、库、资源、Fabric meta 均已接入） |
 | 桌面快捷方式 | 按运行平台生成 Windows `.lnk` / Linux `.desktop` / macOS `.app`；内置尺寸合规的多分辨率图标（`.ico` / `.icns` / hicolor PNG）；**首次运行自动创建且幂等不重复**，重复创建提示覆盖、失败分类报错、无权限自动降级为启动脚本 |
 | 界面体系    | 统一设计令牌（配色 / 间距 / 圆角 / 字号 / 尺寸）+ 单一 QSS 主题；卡片化布局，表格与列表空状态占位，hover / 选中 / 禁用 / 加载四种交互态齐全，自适应常见分辨率                       |
@@ -36,7 +47,7 @@ python main.py                       # 启动图形界面
 其它入口：
 
 ```bash
-python main.py --selftest            # 核心自检，86 项断言，无需界面与网络
+python main.py --selftest            # 核心自检，120 项断言，无需界面与网络
 python main.py --game-dir D:/mc      # 指定游戏目录
 python main.py --mirror official     # 使用官方源
 python main.py --launcher-home D:/pl # 便携模式，配置写在指定目录
@@ -57,6 +68,8 @@ python main.py --create-shortcut --force      # 已存在时直接覆盖
 python tests/smoke_ui.py             # 界面冒烟测试（5 个页面 + 主题/快捷方式卡片检查）
 python tests/smoke_shortcut.py       # 快捷方式端到端测试（真实写盘并行读回校验）
 python tests/smoke_runtime.py        # 运行时健壮性回归（线程取消 / Java 判定 / 下载 / 快捷方式幂等）
+python tests/stress_sim.py 1200      # 沙箱随机模拟压测（1200 次迭代，19 类异常场景）
+python tests/stress_sim.py 1200      # 沙箱随机模拟压测（1200 次迭代，19 类异常场景）
 python tests/e2e_launch.py 1.20.4 15 # 真实下载安装并启动游戏 15 秒
 python tests/screenshot.py           # 开发用：渲染各页面截图到 .shots/
 ```
@@ -84,6 +97,11 @@ mc-launcher/
 │   │   ├── modloader.py         Fabric 组装 / Forge Installer 调用
 │   │   ├── mods.py              Mod 扫描、元数据解析、启停与导入
 │   │   ├── launcher_core.py     参数构建、占位符替换、进程管理
+│   │   ├── netguard.py          软件防火墙：域名白名单 / HTTPS / 体积与路径约束
+│   │   ├── modrinth.py          Modrinth 官方接口：搜索与下载模组 / 光影 / 材质包
+│   │   ├── resources.py         材质包与光影管理（扫描、启停、导入、在线安装）
+│   │   ├── servers.py           服务器列表与 Server List Ping
+│   │   ├── netplay.py           局域网组播发现 + 联机码 + 跨网 TCP 中继
 │   │   ├── shortcut.py          跨平台桌面快捷方式（lnk / desktop / app bundle + 降级脚本）
 │   │   └── selftest.py          核心自检套件
 │   └── ui/                      —— PySide6 界面层
@@ -94,7 +112,7 @@ mc-launcher/
 │       ├── workers.py           通用后台线程（进度 / 消息 / 结果 / 异常）
 │       ├── widgets.py           Card / Badge / BusySpinner / LoadingButton / EmptyState / PathPicker / ProgressDialog / LogWindow
 │       ├── helpers.py           打开目录等小工具
-│       └── pages/               首页 / 版本 / 账户 / Mod / 设置 五个分页
+│       └── pages/               首页 / 版本 / 账户 / Mod / 材质与光影 / 服务器联机 / 设置 七个分页
 └── tests/
     ├── smoke_ui.py              界面冒烟测试
     ├── smoke_shortcut.py        快捷方式端到端测试

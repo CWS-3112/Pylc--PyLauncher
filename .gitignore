@@ -24,3 +24,4 @@ icons/
 # 临时诊断脚本
 .probe_*.py
 .verify_*.py
+cache/

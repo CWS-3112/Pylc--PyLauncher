@@ -44,7 +44,6 @@ DEFAULTS: Dict[str, Any] = {
     "launch": {
         "launcher_visible": True,   # 启动后是否保留启动器窗口
         "show_log_window": True,
-        "wrapper": "",              # 包装命令，如 "primusrun" / "gamemoderun"
         "extra_jvm_args": "",
         "extra_game_args": "",
         "custom_main_class": "",    # 留空则用版本 json 中的 mainClass
@@ -53,6 +52,7 @@ DEFAULTS: Dict[str, Any] = {
         "theme": "system",
         "last_account": "",
         "last_version": "",
+            "animations": True,   # 页面切换动画
     },
     "microsoft": {
         "client_id": "",   # 自建 Azure 应用的 client_id，留空则微软登录不可用
@@ -64,6 +64,7 @@ DEFAULTS: Dict[str, Any] = {
         "auto_create": True,   # 首次运行是否自动创建桌面快捷方式
         "auto_done": False,    # 已尝试过自动创建（成功与否都置位，避免反复打扰）
     },
+    "servers": [],     # 服务器列表（ServerInfo.to_dict）
     "instances": {},   # version_id -> Instance 序列化后的 dict
     "selected_instance": "",
 }
@@ -87,7 +88,6 @@ class Instance:
     width: int = 0                   # 0 = 跟随全局
     height: int = 0
     fullscreen: Optional[bool] = None  # None = 跟随全局
-    wrapper: str = ""
     env: Dict[str, str] = field(default_factory=dict)
     last_played: str = ""
 
@@ -153,6 +153,7 @@ class Config:
                 try:
                     raw = json.loads(self._path.read_text(encoding="utf-8"))
                     self._deep_update(self._data, raw)
+                    self._drop_deprecated()
                     LOG.info("已加载配置：%s", self._path)
                 except Exception as exc:  # noqa: BLE001
                     LOG.warning("配置文件损坏，使用默认值：%s", exc)
@@ -167,6 +168,22 @@ class Config:
                 for vid, data in raw_instances.items()
             }
             self._data["instances"] = {}
+
+    def _drop_deprecated(self) -> None:
+        """清理已下线的配置项，避免旧文件里留下无人读取的死字段。
+
+        目前只有一处：`launch.wrapper`（「包装命令」/加速器注入）已从界面移除，
+        加载时顺手删掉，用户下次保存后配置里就不会再有它。
+        """
+        launch = self._data.get("launch")
+        if isinstance(launch, dict) and "wrapper" in launch:
+            launch.pop("wrapper", None)
+            LOG.info("已清理废弃配置项 launch.wrapper")
+        instances = self._data.get("instances")
+        if isinstance(instances, dict):
+            for data in instances.values():
+                if isinstance(data, dict):
+                    data.pop("wrapper", None)
 
     def save(self) -> None:
         with self._lock:

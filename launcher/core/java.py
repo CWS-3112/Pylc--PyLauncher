@@ -286,8 +286,33 @@ def probe_java(path: Path, timeout: float = 6.0) -> Optional[JavaInfo]:
         return None
 
 
-def find_java(include_path: bool = True) -> List[JavaInfo]:
-    """扫描本机所有可用 Java，按「主版本号降序 + 64 位优先」排序。"""
+# 探测结果缓存：每次 `java -version` 都是一次子进程启动（实测约 0.6s），
+# 而切换页面 / 打开实例设置都会触发，不缓存会让界面明显发涩。
+_CACHE_TTL = 30.0
+_find_cache: Dict[bool, tuple] = {}
+
+
+def find_java(include_path: bool = True, use_cache: bool = True) -> List[JavaInfo]:
+    """扫描本机所有可用 Java，按「主版本号降序 + 64 位优先」排序。
+
+    结果默认缓存 30 秒（`use_cache=False` 或 `invalidate_cache()` 可强制重扫）。
+    """
+    if use_cache:
+        import time as _time
+
+        hit = _find_cache.get(include_path)
+        if hit and _time.time() - hit[0] < _CACHE_TTL:
+            return list(hit[1])
+
+    result = _scan_java(include_path)
+    if use_cache:
+        import time as _time
+
+        _find_cache[include_path] = (_time.time(), tuple(result))
+    return result
+
+
+def _scan_java(include_path: bool = True) -> List[JavaInfo]:
     seen: Dict[str, JavaInfo] = {}
 
     roots: List[Path] = []
@@ -318,7 +343,7 @@ def find_java(include_path: bool = True) -> List[JavaInfo]:
         key=lambda i: (i.bitness == 64, i.major, str(i.path)),
         reverse=True,
     )
-    LOG.info("检测到 %d 个 Java 运行环境", len(result))
+    LOG.info("扫描到 %d 个 Java 运行环境", len(result))
     return result
 
 
@@ -328,7 +353,9 @@ def cached_find_java() -> tuple:
 
 
 def invalidate_cache() -> None:
+    """手动「重新检测 Java」时调用：清空探测缓存。"""
     cached_find_java.cache_clear()
+    _find_cache.clear()
 
 
 # -------------------------------------------------------------------- 选择

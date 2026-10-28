@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -31,6 +32,8 @@ from .icons import app_icon, render_logo
 from .pages.accounts import AccountPage
 from .pages.home import HomePage
 from .pages.mods import ModPage
+from .pages.resources import ResourcePage
+from .pages.servers import ServerPage
 from .pages.settings import SettingsPage
 from .pages.versions import VersionPage
 from .theme import METRICS, SPACE, apply_theme
@@ -41,6 +44,8 @@ NAV_ITEMS = [
     ("versions", "版本管理"),
     ("accounts", "账户管理"),
     ("mods", "Mod 管理"),
+    ("resources", "材质与光影"),
+    ("servers", "服务器联机"),
     ("settings", "设置"),
 ]
 
@@ -67,8 +72,8 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._connect_signals()
-        self.refresh_all()
-
+        # 构造阶段不做全局刷新：`run()` 会在窗口显示之后调用 `refresh_all()`，
+        # 这样首帧只是轻量骨架，避免"空白窗口闪一下才出内容"。
         # 首次运行自动补上桌面快捷方式（幂等，失败不打扰）
         QTimer.singleShot(400, self._maybe_auto_create_shortcut)
 
@@ -106,21 +111,46 @@ class MainWindow(QMainWindow):
 
         outer.addWidget(self._build_sidebar())
 
-        self.stack = QStackedWidget()
+        from .anim import CrossFadeStack
+
+        self.stack = CrossFadeStack(central)
         outer.addWidget(self.stack, 1)
 
-        self.pages: dict[str, QWidget] = {
-            "home": HomePage(self),
-            "versions": VersionPage(self),
-            "accounts": AccountPage(self),
-            "mods": ModPage(self),
-            "settings": SettingsPage(self),
+        # 页面**按需构建**：一次性实例化 7 个分页要 ~850ms，而这些控件
+        # 用户在首屏根本看不到；改成首次导航时才创建，首屏只留首页。
+        self._page_builders = {
+            "home": HomePage,
+            "versions": VersionPage,
+            "accounts": AccountPage,
+            "mods": ModPage,
+            "resources": ResourcePage,
+            "servers": ServerPage,
+            "settings": SettingsPage,
         }
-        for key, page in self.pages.items():
-            self.stack.addWidget(page)
+        self.pages: dict[str, QWidget] = {}
+        self._dirty: set[str] = set()
+        self._refreshed_at: dict[str, float] = {}
+        self.ensure_page("home")
 
         self._build_statusbar()
         self._bind_shortcuts()
+
+    # ---------------------------------------------------------------- 分页
+
+    def ensure_page(self, key: str):
+        """确保分页已构建（懒加载）；返回该页。"""
+        page = self.pages.get(key)
+        if page is not None:
+            return page
+        builder = self._page_builders.get(key)
+        if builder is None:
+            return None
+        started = time.perf_counter()
+        page = builder(self)
+        self.pages[key] = page
+        self.stack.addWidget(page)
+        LOG.debug("构建分页 %s 用时 %.0fms", key, (time.perf_counter() - started) * 1000)
+        return page
 
     def _build_sidebar(self) -> QWidget:
         sidebar = QFrame()
@@ -157,18 +187,34 @@ class MainWindow(QMainWindow):
         layout.addWidget(brand)
         layout.addSpacing(SPACE["lg"])
 
-        # ---- 导航
+        # ---- 导航（按「玩游戏 / 装内容 / 设置」分组，条目多了也不至于糊成一片）
         self.nav_group = QButtonGroup(self)
         self.nav_group.setExclusive(True)
-        for index, (key, text) in enumerate(NAV_ITEMS):
-            btn = QPushButton(f"{text}")
-            btn.setProperty("navButton", True)
-            btn.setCheckable(True)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setToolTip(f"{text}（Ctrl+{index + 1}）")
-            btn.clicked.connect(lambda _=False, k=key: self.navigate(k))
-            self.nav_group.addButton(btn)
-            layout.addWidget(btn)
+        groups = [
+            ("游戏", ["home", "servers"]),
+            ("内容", ["versions", "mods", "resources"]),
+            ("其它", ["accounts", "settings"]),
+        ]
+        order = {key: index for index, (key, _text) in enumerate(NAV_ITEMS)}
+        self.nav_buttons: dict[str, QPushButton] = {}
+        for title, keys in groups:
+            label = QLabel(title)
+            label.setObjectName("SidebarGroup")
+            layout.addWidget(label)
+            for key in keys:
+                if key not in order:
+                    continue
+                text = dict(NAV_ITEMS)[key]
+                btn = QPushButton(text)
+                btn.setProperty("navButton", True)
+                btn.setCheckable(True)
+                btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn.setToolTip(f"{text}（Ctrl+{order[key] + 1}）")
+                btn.clicked.connect(lambda _=False, k=key: self.navigate(k))
+                self.nav_group.addButton(btn)
+                self.nav_buttons[key] = btn
+                layout.addWidget(btn)
+            layout.addSpacing(SPACE["sm"])
 
         layout.addStretch(1)
 
@@ -205,7 +251,7 @@ class MainWindow(QMainWindow):
         else:
             self.flash(f"已自动创建桌面快捷方式：{result.path}")
         page = self.pages.get("settings")
-        refresh = getattr(page, "_refresh_shortcut_state", None)
+        refresh = getattr(page, "_refresh_shortcut_state", None) if page else None
         if callable(refresh):
             refresh()
 
@@ -241,33 +287,66 @@ class MainWindow(QMainWindow):
         self.flash("已刷新")
 
     def _connect_signals(self) -> None:
-        self.instancesChanged.connect(self.pages["home"].refresh)
-        self.instancesChanged.connect(self.pages["mods"].refresh)
-        self.accountsChanged.connect(self.pages["home"].refresh)
+        # 只连已构建的分页，其余在 ensure_page 时补连（见 _bind_lazy_signal）
+        self.instancesChanged.connect(self._safe_refresh("home"))
+        self.instancesChanged.connect(self._safe_refresh("mods"))
+        self.accountsChanged.connect(self._safe_refresh("home"))
         self.gameDirChanged.connect(self._on_game_dir_changed)
-        self.settingsChanged.connect(self.pages["home"].refresh)
+        self.settingsChanged.connect(self._safe_refresh("home"))
+
+    def _safe_refresh(self, key: str):
+        """对懒加载分页安全的刷新槽：页面还没建就跳过，建了才刷。"""
+
+        def slot() -> None:
+            page = self.pages.get(key)
+            if page is None:
+                return
+            method = getattr(page, "refresh", None)
+            if callable(method) and self._needs_refresh(key):
+                method()
+                self._refreshed_at[key] = time.time()
+                self._dirty.discard(key)
+
+        return slot
+
+    # ---------------------------------------------------------------- 渲染去重
+
+    def mark_dirty(self, *keys: str) -> None:
+        """标记分页数据已变化，下次导航时才会真正刷新。"""
+        self._dirty.update(keys)
+
+    def _needs_refresh(self, key: str, min_interval: float = 0.5) -> bool:
+        """刚刷过（<0.5s）且没有脏标记时跳过，避免重复渲染整张表。"""
+        if key in self._dirty:
+            return True
+        last = self._refreshed_at.get(key, 0.0)
+        return (time.time() - last) > min_interval
 
     # ---------------------------------------------------------------- 导航
 
     def navigate(self, key: str) -> None:
-        page = self.pages.get(key)
+        page = self.ensure_page(key)
         if page is None:
             return
         self.stack.setCurrentWidget(page)
         refresh = getattr(page, "refresh", None)
         if callable(refresh):
-            refresh()
-        for index, (nav_key, _text) in enumerate(NAV_ITEMS):
-            if nav_key == key:
-                buttons = self.nav_group.buttons()
-                if index < len(buttons):
-                    buttons[index].setChecked(True)
-                break
+            # 避免重复渲染：短时间内反复切换（或信号重复触发）不再重建整张表，
+            # 只有被标记为脏数据的页面才真正刷新。
+            if self._needs_refresh(key):
+                refresh()
+                self._refreshed_at[key] = time.time()
+                self._dirty.discard(key)
+        # 按 key 定位按钮：分组后的按钮顺序与 NAV_ITEMS 不再一致，不能用下标
+        button = getattr(self, "nav_buttons", {}).get(key)
+        if button is not None:
+            button.setChecked(True)
 
     def refresh_all(self) -> None:
         self.navigate("home")
-        if self.nav_group.buttons():
-            self.nav_group.buttons()[0].setChecked(True)
+        first = getattr(self, "nav_buttons", {}).get("home")
+        if first is not None:
+            first.setChecked(True)
         self._update_chip()
 
     def _update_chip(self) -> None:
@@ -276,6 +355,7 @@ class MainWindow(QMainWindow):
         versions = scan_local_versions(self.game_dir())
         playable = [v for v in versions if v.playable]
         account = self.accounts_db.selected
+        self._chip_versions = len(playable)
         self.status_chip.setText(
             f"可用版本 {len(playable)} 个\n账户 {account.username if account else '未添加'}"
         )
@@ -316,10 +396,12 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------------- 通知
 
     def notify_instances_changed(self) -> None:
+        self._mark_dirty_on_change()
         self.instancesChanged.emit()
         self._update_chip()
 
     def notify_accounts_changed(self) -> None:
+        self.mark_dirty("home", "accounts")
         self.accountsChanged.emit()
         self._update_chip()
 
@@ -329,6 +411,9 @@ class MainWindow(QMainWindow):
 
     def notify_game_dir_changed(self) -> None:
         self.gameDirChanged.emit()
+
+    def _mark_dirty_on_change(self) -> None:
+        self.mark_dirty("home", "versions", "mods", "resources")
 
     def _on_game_dir_changed(self) -> None:
         for page in self.pages.values():
@@ -369,6 +454,60 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------------- 关闭
 
+    def shutdown(self, wait_ms: int = 1500) -> None:
+        """退出前收尾所有后台任务。
+
+        不做这一步时，关闭窗口瞬间仍在跑的 QThread / 线程池会与解释器关闭竞争，
+        日志出现 `cannot schedule new futures after interpreter shutdown`，
+        严重时直接 abort —— 这是「来回切换后关闭就崩」的主要来源之一。
+        """
+        # 1) 服务器页的中继与局域网扫描（普通线程，需显式停）
+        servers = self.pages.get("servers")
+        if servers is not None:
+            for attr in ("_scanner", "_relay"):
+                obj = getattr(servers, attr, None)
+                stop = getattr(obj, "stop", None)
+                if callable(stop):
+                    try:
+                        stop()
+                    except Exception:  # noqa: BLE001
+                        pass
+            timer = getattr(servers, "_scan_timer", None)
+            if timer is not None:
+                try:
+                    timer.stop()
+                except RuntimeError:
+                    pass
+
+        # 2) 各分页登记的 Worker（下载 / 探测 / 登录…）
+        from .workers import wait_worker
+
+        for page in list(self.pages.values()):
+            for worker in list(getattr(page, "_workers", [])):
+                try:
+                    worker.request_cancel()
+                except RuntimeError:
+                    continue
+            for worker in list(getattr(page, "_workers", [])):
+                wait_worker(worker, wait_ms)
+
+        # 3) 动画叠加层
+        stack = getattr(self, "stack", None)
+        dispose = getattr(stack, "_dispose_overlay", None)
+        if callable(dispose):
+            try:
+                dispose()
+            except RuntimeError:
+                pass
+
+        # 4) 共用的 IO 线程池
+        try:
+            from ..core.http import shutdown_io_pool
+
+            shutdown_io_pool(wait=False)
+        except Exception:  # noqa: BLE001
+            pass
+
     def closeEvent(self, event) -> None:  # noqa: N802
         if self.game_running:
             answer = QMessageBox.question(
@@ -380,6 +519,7 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
+        self.shutdown()
         event.accept()
 
 
@@ -392,6 +532,20 @@ def run(config: Optional[Config] = None) -> int:
     app = QApplication.instance() or QApplication(sys.argv)
     apply_theme(app)
     app.setWindowIcon(app_icon())
+
     window = MainWindow(config)
+    # 先让窗口可见（此时只有骨架，绘制极快），随后再填充数据；
+    # 反过来（先填数据后 show）会看到一次空白窗口闪烁。
     window.show()
-    return app.exec()
+    QApplication.processEvents()
+    window.refresh_all()
+    if hasattr(window, "stack") and hasattr(window.stack, "setCurrentIndex"):
+        window.stack.setCurrentIndex(0)
+    try:
+        return app.exec()
+    finally:
+        # 兜底：即便窗口被强制关闭（未走 closeEvent），也要收尾后台线程
+        try:
+            window.shutdown(300)
+        except Exception:  # noqa: BLE001
+            pass

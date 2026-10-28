@@ -8,8 +8,10 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
     QDialogButtonBox,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
+    QCheckBox,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
@@ -128,6 +130,25 @@ class AccountPage(BasePage):
         ms_card.add(self.ms_hint)
         root.addWidget(ms_card)
 
+        # ---- 第三方（外置）登录
+        third_card = Card(
+            "第三方账号登录（外置登录）",
+            subtitle="支持 Yggdrasil 协议的皮肤站：Blessing Skin、统一通行证、LittleSkin 等",
+        )
+        row3 = QHBoxLayout()
+        row3.setSpacing(SPACE["md"])
+        self.add_third_btn = QPushButton("外置登录…")
+        self.add_third_btn.setProperty("primary", True)
+        self.add_third_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.add_third_btn.clicked.connect(self._add_yggdrasil)
+        row3.addWidget(self.add_third_btn)
+        self.third_hint = QLabel("")
+        self.third_hint.setProperty("micro", True)
+        self.third_hint.setWordWrap(True)
+        row3.addWidget(self.third_hint, 1)
+        third_card.add_layout(row3)
+        root.addWidget(third_card)
+
     # ---------------------------------------------------------------- 刷新
 
     def refresh(self) -> None:
@@ -234,7 +255,14 @@ class AccountPage(BasePage):
 
     def _refresh_token(self) -> None:
         acc = self._current()
-        if acc is None or acc.type != "microsoft":
+        if acc is None:
+            self.warn("请先选择一个账户")
+            return
+        if acc.type == "yggdrasil":
+            self._refresh_yggdrasil(acc)
+            return
+        if acc.type != "microsoft":
+            self.warn("离线账户无需刷新令牌")
             return
         client_id = str(self.config.get("microsoft.client_id", "") or "")
         if not client_id:
@@ -247,6 +275,41 @@ class AccountPage(BasePage):
 
         def work(on_progress, on_message):
             return MicrosoftAuthenticator(client_id).refresh(acc)
+
+        worker = Worker(work)
+
+        def done(new_acc):
+            dlg.accept()
+            self.accounts_db.add(new_acc)
+            self.refresh()
+            self.main.notify_accounts_changed()
+            self.info("令牌已刷新。")
+
+        worker.succeeded.connect(done)
+        worker.failed.connect(dlg.done_with_error)
+        start_worker(self, worker)
+        dlg.exec()
+        wait_worker(worker, 1500)
+
+    # ---------------------------------------------------------------- 外置登录
+
+    def _add_yggdrasil(self) -> None:
+        dlg = YggdrasilLoginDialog(self.config, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.account is not None:
+            self.accounts_db.add(dlg.account)
+            self.refresh()
+            self.main.notify_accounts_changed()
+            self.info(f"外置登录成功：{dlg.account.username}")
+
+    def _refresh_yggdrasil(self, acc) -> None:
+        dlg = ProgressDialog("刷新外置登录令牌", self, cancelable=False)
+        dlg.set_indeterminate()
+        dlg.set_stage("正在刷新…")
+
+        def work(on_progress, on_message):
+            from ...core.auth import refresh_account
+
+            return refresh_account(acc)
 
         worker = Worker(work)
 
@@ -279,6 +342,107 @@ class AccountPage(BasePage):
 
 
 # -------------------------------------------------------------------- 设备码对话框
+
+
+class YggdrasilLoginDialog(QDialog):
+    """第三方（外置）登录：服务器地址 + 账号 + 密码。"""
+
+    def __init__(self, config, parent=None) -> None:
+        super().__init__(parent)
+        self.config = config
+        self.account = None
+        self._worker: Worker | None = None
+        self.setWindowTitle("第三方账号登录")
+        self.setModal(True)
+        self.resize(560, 300)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(SPACE["xxl"], SPACE["xl"], SPACE["xxl"], SPACE["lg"])
+        layout.setSpacing(SPACE["lg"])
+
+        title = QLabel("外置登录（Yggdrasil）")
+        title.setProperty("subheading", True)
+        layout.addWidget(title)
+
+        form = QFormLayout()
+        form.setHorizontalSpacing(SPACE["lg"])
+        form.setVerticalSpacing(SPACE["md"])
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        self.server_edit = QLineEdit()
+        self.server_edit.setPlaceholderText("https://skin.example.com/api/yggdrasil")
+        self.server_edit.setText(str(config.get("auth.yggdrasil_url", "") or ""))
+        self.server_edit.setMinimumHeight(METRICS["control_height"])
+
+        self.user_edit = QLineEdit()
+        self.user_edit.setPlaceholderText("账号或邮箱")
+        self.user_edit.setMinimumHeight(METRICS["control_height"])
+
+        self.pass_edit = QLineEdit()
+        self.pass_edit.setPlaceholderText("密码")
+        self.pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.pass_edit.setMinimumHeight(METRICS["control_height"])
+
+        self.save_cb = QCheckBox("记住服务器地址")
+        self.save_cb.setChecked(True)
+        self.save_cb.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        form.addRow("服务器地址：", self.server_edit)
+        form.addRow("账号：", self.user_edit)
+        form.addRow("密码：", self.pass_edit)
+        form.addRow("", self.save_cb)
+        layout.addLayout(form)
+
+        self.hint = QLabel(
+            "登录凭据只会发给该服务器，启动器不做任何中转存储；"
+            "该域名会被自动加入网络安全白名单。"
+        )
+        self.hint.setProperty("micro", True)
+        self.hint.setWordWrap(True)
+        layout.addWidget(self.hint)
+
+        buttons = QDialogButtonBox()
+        localize_buttons(buttons, ok="登录", cancel="取消")
+        buttons.accepted.connect(self._do_login)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _do_login(self) -> None:
+        url = self.server_edit.text().strip()
+        user = self.user_edit.text().strip()
+        pwd = self.pass_edit.text()
+        if not url or not user or not pwd:
+            self.hint.setText("服务器地址、账号、密码都不能为空")
+            return
+        if self.save_cb.isChecked():
+            self.config.set("auth.yggdrasil_url", url)
+
+        dlg = ProgressDialog("正在登录", self, cancelable=False)
+        dlg.set_indeterminate()
+        dlg.set_stage("连接认证服务器…")
+
+        def work(on_progress, on_message):
+            from ...core.auth import YggdrasilAuthenticator
+
+            return YggdrasilAuthenticator(url).login(user, pwd)
+
+        worker = Worker(work)
+
+        def done(acc):
+            dlg.accept()
+            self.account = acc
+            self.accept()
+
+        def failed(message):
+            dlg.accept()
+            self.hint.setText(f"登录失败：{message.splitlines()[0]}")
+            self.pass_edit.clear()
+
+        worker.succeeded.connect(done)
+        worker.failed.connect(failed)
+        start_worker(self, worker)
+        dlg.exec()
+        wait_worker(worker, 1500)
 
 
 class MicrosoftLoginDialog(QDialog):

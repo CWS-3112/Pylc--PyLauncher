@@ -32,6 +32,7 @@ from .utils import LOG, ensure_dir
 
 OFFLINE = "offline"
 MICROSOFT = "microsoft"
+YGGDRASIL = "yggdrasil"     # 第三方（外置）登录：Blessing Skin / 统一通行证 / LittleSkin …
 
 
 # -------------------------------------------------------------------- 账户
@@ -68,7 +69,16 @@ class Account:
 
     @property
     def type_label(self) -> str:
-        return "离线" if self.type == OFFLINE else "微软正版"
+        if self.type == OFFLINE:
+            return "离线"
+        if self.type == YGGDRASIL:
+            return "外置登录"
+        return "微软正版"
+
+    @property
+    def server_url(self) -> str:
+        """外置登录的认证服务器地址（离线/微软为空）。"""
+        return str(self.extra.get("server_url", "") or "")
 
     @property
     def display(self) -> str:
@@ -309,6 +319,200 @@ class MicrosoftAuthenticator:
         refreshed.selected = account.selected
         refreshed.client_token = account.client_token
         return refreshed
+
+
+# -------------------------------------------------------------------- 第三方（外置）登录
+
+
+class YggdrasilError(Exception):
+    """外置登录失败。"""
+
+
+class YggdrasilAuthenticator:
+    """Yggdrasil 协议客户端，用于接入第三方皮肤站 / 统一通行证。
+
+    标准流程：
+    * `POST <server>/authserver/authenticate` 用账号密码换 accessToken；
+    * `POST /authserver/refresh` 续期；
+    * `POST /authserver/validate` 校验令牌是否还有效。
+
+    用户填的地址属于「自己主动信任的服务」，因此会把域名加入防火墙白名单，
+    否则请求会被 `netguard` 拦下。
+    """
+
+    def __init__(self, server_url: str, timeout: float = 15.0) -> None:
+        self.server_url = (server_url or "").rstrip("/")
+        if not self.server_url:
+            raise YggdrasilError("请先填写外置登录服务器地址")
+        if not self.server_url.startswith(("http://", "https://")):
+            self.server_url = "https://" + self.server_url
+        self.timeout = timeout
+        self._trust_host()
+
+    # ---------------------------------------------------------- 内部
+
+    def _trust_host(self) -> None:
+        from urllib.parse import urlparse
+
+        from .netguard import guard
+
+        host = urlparse(self.server_url).hostname or ""
+        if host and not guard.is_allowed(host):
+            # http 仅在访问内网自建皮肤站时允许，这里同样放行
+            guard.add_host(host)
+            LOG.info("已将外置登录服务器加入白名单：%s", host)
+
+    def _post(self, path: str, payload: Dict) -> Dict:
+        import requests
+        from urllib.parse import urlparse
+
+        url = f"{self.server_url}{path}"
+        from .netguard import guard
+
+        host = urlparse(url).hostname or ""
+        if host and host not in guard.extra and not guard.is_allowed(host):
+            guard.add_host(host)
+        try:
+            resp = requests.post(
+                url,
+                json=payload,
+                timeout=(10, self.timeout),
+                headers={
+                    "Content-Type": "application/json; charset=utf-8",
+                    "User-Agent": "PyLauncher/1.2",
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise YggdrasilError(f"无法连接认证服务器：{exc}") from exc
+
+        code = resp.status_code
+        if code == 403 or code == 401:
+            try:
+                detail = resp.json()
+            except Exception:  # noqa: BLE001
+                detail = {}
+            message = detail.get("errorMessage") or detail.get("message") or "账号或密码错误"
+            raise YggdrasilError(message)
+        if code >= 400:
+            raise YggdrasilError(f"认证服务器返回 HTTP {code}")
+        try:
+            data = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            raise YggdrasilError("认证服务器返回的不是合法 JSON（地址可能填错）") from exc
+        if isinstance(data, dict) and data.get("error"):
+            raise YggdrasilError(str(data.get("errorMessage") or data["error"]))
+        return data
+
+    # ---------------------------------------------------------- 对外
+
+    def login(self, username: str, password: str, client_token: str = "") -> Account:
+        name = (username or "").strip()
+        if not name:
+            raise YggdrasilError("请填写账号")
+        if not password:
+            raise YggdrasilError("请填写密码")
+
+        token = client_token or uuid.uuid4().hex
+        payload = {
+            "username": name,
+            "password": password,
+            "clientToken": token,
+            "requestUser": True,
+        }
+        # 部分皮肤站只接受老式的 agent 字段
+        try:
+            data = self._post("/authserver/authenticate", payload)
+        except YggdrasilError:
+            data = self._post("/authserver/authenticate", {
+                **payload,
+                "agent": {"name": "Minecraft", "version": 1},
+            })
+
+        profiles = data.get("availableProfiles") or []
+        selected = data.get("selectedProfile") or (profiles[0] if profiles else {})
+        if not selected:
+            raise YggdrasilError("该账号下没有可用角色，请先在皮肤站创建角色")
+        acc_uuid = str(selected.get("id") or selected.get("uuid") or "").replace("-", "")
+        if not acc_uuid:
+            raise YggdrasilError("认证服务器返回的角色信息缺少 UUID")
+
+        account = Account(
+            username=str(selected.get("name") or name),
+            uuid=acc_uuid,
+            type=YGGDRASIL,
+            access_token=str(data.get("accessToken") or ""),
+            refresh_token=str((data.get("refreshToken") or "")),
+            client_token=str(data.get("clientToken") or token),
+            extra={
+                "server_url": self.server_url,
+                "login_name": name,
+            },
+        )
+        if not account.access_token:
+            raise YggdrasilError("认证服务器未返回 accessToken")
+        LOG.info("外置登录成功：%s @ %s", account.username, self.server_url)
+        return account
+
+    def refresh(self, account: Account) -> Account:
+        if account.type != YGGDRASIL:
+            raise YggdrasilError("该账户不是外置登录账户")
+        if not account.access_token:
+            raise YggdrasilError("缺少令牌，请重新登录")
+        payload = {
+            "accessToken": account.access_token,
+            "clientToken": account.client_token or uuid.uuid4().hex,
+            "requestUser": True,
+        }
+        try:
+            data = self._post("/authserver/refresh", payload)
+        except YggdrasilError as exc:
+            raise YggdrasilError(f"刷新失败：{exc}") from exc
+        return Account(
+            username=account.username,
+            uuid=account.uuid,
+            type=YGGDRASIL,
+            access_token=str(data.get("accessToken") or account.access_token),
+            refresh_token=str(data.get("refreshToken") or account.refresh_token),
+            client_token=str(data.get("clientToken") or account.client_token),
+            selected=account.selected,
+            extra={**account.extra, "server_url": self.server_url},
+        )
+
+    def validate(self, account: Account) -> bool:
+        """令牌是否仍然有效（无效需要重新登录）。"""
+        if not account.access_token:
+            return False
+        try:
+            self._post("/authserver/validate", {
+                "accessToken": account.access_token,
+                "clientToken": account.client_token,
+            })
+            return True
+        except YggdrasilError:
+            return False
+
+
+def refresh_account(account: Account) -> Account:
+    """按账户类型选择刷新方式（微软 / 外置登录）。"""
+    if account.type == MICROSOFT:
+        client_id = str(account.extra.get("client_id", "") or "")
+        if not client_id:
+            from .config import get_config
+
+            client_id = str(get_config().get("microsoft.client_id", "") or "")
+        if not client_id:
+            raise RuntimeError("缺少 Azure client_id，无法刷新微软令牌")
+        return MicrosoftAuthenticator(client_id).refresh(account)
+    if account.type == YGGDRASIL:
+        url = account.server_url
+        if not url:
+            from .config import get_config
+
+            url = str(get_config().get("auth.yggdrasil_url", "") or "")
+        if not url:
+            raise RuntimeError("缺少外置登录服务器地址，无法刷新")
+        return YggdrasilAuthenticator(url).refresh(account)
+    raise RuntimeError("离线账户无需刷新")
 
 
 # -------------------------------------------------------------------- 账户库

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -53,6 +54,7 @@ from ..widgets import (
     localize_buttons,
     make_heading,
 )
+from ..anim import attach_tab_fade
 from ..workers import Worker, start_worker, wait_worker
 from .base import BasePage
 
@@ -62,8 +64,14 @@ class VersionPage(BasePage):
         super().__init__(main)
         self._local_versions: list[LocalVersion] = []
         self._forge_cache: dict[str, list[ForgeVersionInfo]] = {}
+        self._remote_error = ""
+        self._retry_btn = None
+        self._remote_hint = ""
+        self._silent_started = False
         self._build_ui()
         self.refresh()
+        # 进入页面即尝试「缓存秒开 + 后台静默刷新」，不必等用户点按钮
+        QTimer.singleShot(0, self._silent_refresh)
 
     # ---------------------------------------------------------------- 界面
 
@@ -251,9 +259,31 @@ class VersionPage(BasePage):
         table = self.remote_table
         table.setRowCount(0)
         if not manifest.loaded:
-            self.remote_stack.setCurrentIndex(1)
-            self.remote_summary.setText("")
-            return
+            # 先尝试本地缓存：宁可立刻显示一份旧列表，也不要白屏等网络
+            if manifest.load_cached():
+                self._remote_hint = "本地缓存"
+            else:
+                self.remote_stack.setCurrentIndex(1)
+                self.remote_empty.set_loading(False)
+                if self._remote_error:
+                    self.remote_empty.set_text(
+                        "版本列表加载失败",
+                        f"{self._remote_error}\n\n可检查网络、在「设置」里切换下载源后重试。",
+                    )
+                    if self._retry_btn is None:
+                        self._retry_btn = QPushButton("重试")
+                        self._retry_btn.setProperty("accent", True)
+                        self._retry_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                        self._retry_btn.clicked.connect(self._fetch_manifest)
+                        self.remote_empty.set_action(self._retry_btn)
+                else:
+                    self.remote_empty.set_text(
+                        "还没有获取版本列表",
+                        "点击下方「获取版本列表」从官方或镜像源拉取全部可用版本。",
+                    )
+                    self.remote_empty.set_action(None)
+                self.remote_summary.setText("")
+                return
 
         wanted = set()
         if self.show_release.isChecked():
@@ -306,11 +336,23 @@ class VersionPage(BasePage):
 
         if count:
             self.remote_stack.setCurrentIndex(0)
-            self.remote_summary.setText(f"共 {count} 个版本可选")
+            self.remote_summary.setText(
+                f"共 {count} 个版本可选"
+                + ("（离线缓存，联网后请重新获取）" if manifest.stale else "")
+            )
         else:
             self.remote_stack.setCurrentIndex(1)
-            self.remote_empty.set_text("没有符合条件的版本", "请调整筛选条件或清空搜索关键词。")
-            self.remote_summary.setText(f"共 {count} 个版本可选")
+            if keyword or len(wanted) < 4:
+                self.remote_empty.set_text("没有符合条件的版本", "请调整筛选条件或清空搜索关键词。")
+                self.remote_summary.setText(f"共 {count} 个版本可选")
+            else:
+                # 列表拿到了但一条都没有 —— 这是清单异常，不能说成「没有符合条件的版本」
+                self.remote_empty.set_text(
+                    "版本列表为空",
+                    "下载源返回的清单里没有任何版本，请点击「获取版本列表」重试，"
+                    "或到「设置」里切换下载源。",
+                )
+                self.remote_summary.setText("清单异常：0 个版本")
 
     # ---------------------------------------------------------------- 加载器
 
@@ -364,6 +406,7 @@ class VersionPage(BasePage):
         card.add_layout(bar)
         layout.addWidget(card)
 
+        attach_tab_fade(self.tabs)
         hint = QLabel(
             "说明：Fabric 由本启动器直接组装版本；Forge 会调用官方 Installer"
             "（需要 Java 与网络）。安装前请先在「下载新版本」中装好对应的原版。"
@@ -396,20 +439,59 @@ class VersionPage(BasePage):
 
     # ---------------------------------------------------------------- 远程列表
 
-    def _fetch_manifest(self) -> None:
-        mirror = str(self.config.get("mirror", "bmclapi"))
-        dlg = ProgressDialog("获取版本列表", self)
+    def _silent_refresh(self) -> None:
+        """后台静默刷新：只做一次，失败也不弹窗打扰（列表仍显示缓存）。"""
+        if self._silent_started or manifest.loaded and not manifest.stale:
+            return
+        self._silent_started = True
 
-        should = {"stop": False}
+        def work(on_progress, on_message, should_cancel=None):
+            from ...core.http import available_mirror
+
+            usable = available_mirror(str(self.config.get("mirror", "bmclapi")))
+            if usable != str(self.config.get("mirror", "bmclapi")):
+                self.config.set("mirror", usable)
+            manifest.refresh(usable, force=True)
+            return len(manifest.all())
+
+        def on_done(n):
+            self._remote_error = ""
+            self._remote_hint = ""
+            self._reload_remote_table()
+            self.flash(f"版本列表已更新，共 {n} 个版本")
+
+        def on_error(message):
+            # 静默失败：保留缓存数据，只在摘要里说明
+            self._remote_error = str(message).splitlines()[0][:160]
+            self._reload_remote_table()
+
+        worker = Worker(work)
+        worker.succeeded.connect(on_done)
+        worker.failed.connect(on_error)
+        start_worker(self, worker)
+
+    def _fetch_manifest(self) -> None:
+        """获取版本列表：缓存优先 + 并发取源 + 进度与耗时反馈。"""
+        mirror = str(self.config.get("mirror", "bmclapi"))
+        started = time.time()
+        self._remote_error = ""
+
+        # 有缓存就先把列表渲染出来，再联网刷新——避免对着空白等网络
+        had_cache = manifest.load_cached()
+        if had_cache:
+            self._reload_remote_table()
+
+        dlg = ProgressDialog("获取版本列表", self)
+        if had_cache:
+            dlg.set_stage("已显示本地缓存，正在联网更新…")
 
         def work(on_progress, on_message):
             on_message("检查下载源可用性…")
-            # 优先挑一个当前真能连通的源，避免「点了没反应然后失败」
             from ...core.http import available_mirror
 
             usable = available_mirror(mirror)
             if usable != mirror:
-                on_message(f"检测到 {mirror} 不可用，已切换到 {usable}")
+                on_message(f"{mirror} 不可用，已切换到 {usable}")
                 self.config.set("mirror", usable)
             on_message("连接版本清单服务器…")
             manifest.refresh(usable, force=True)
@@ -417,10 +499,47 @@ class VersionPage(BasePage):
 
         worker = Worker(work)
         worker.message.connect(dlg.set_stage)
-        worker.succeeded.connect(lambda n: (dlg.set_stage(f"共获取到 {n} 个版本"), dlg.accept(), self._reload_remote_table()))
-        worker.failed.connect(dlg.done_with_error)
+
+        def tick() -> None:
+            """每 500ms 回报一次耗时，长时间等待也有反馈（不会像卡死）。"""
+            if worker.isRunning():
+                dlg.set_stage(f"正在获取…（已用时 {time.time() - started:.0f}s）")
+                QTimer.singleShot(500, tick)
+
+        QTimer.singleShot(500, tick)
+
+        def on_fetched(n):
+            dlg.set_stage(f"共 {n} 个版本，用时 {time.time() - started:.1f}s")
+            dlg.accept()
+            self._remote_error = ""
+            self._reload_remote_table()
+            if manifest.stale:
+                age = ""
+                if manifest.fetched_at:
+                    days = max(0, int((time.time() - manifest.fetched_at) // 86400))
+                    age = f"，缓存于 {days} 天前" if days else "，缓存于今天"
+                self.warn(
+                    "无法连接到下载源，已改用本地缓存的版本列表"
+                    f"{age}。\n\n可安装已有版本，但看不到新发布的版本；"
+                    "联网后请重新点击「获取版本列表」。"
+                )
+            else:
+                self.flash(f"版本列表已更新（{n} 个版本，{time.time() - started:.1f}s）")
+
+        def on_failed(message):
+            self._remote_error = str(message).splitlines()[0][:200]
+            dlg.accept()
+            self._reload_remote_table()
+            self.error(
+                f"获取版本列表失败：\n{self._remote_error}\n\n"
+                "已尝试官方源与镜像源。可检查网络连接、代理设置，"
+                "或到「设置 → 下载源」手动切换后再试。"
+            )
+
+        worker.succeeded.connect(on_fetched)
+        worker.failed.connect(on_failed)
         # 协作式取消：只置标记，绝不使用 terminate（强杀线程会随机崩溃）
-        dlg.cancelled.connect(lambda: (should.__setitem__("stop", True), worker.request_cancel()))
+        dlg.cancelled.connect(worker.request_cancel)
         start_worker(self, worker)
         dlg.exec()
         wait_worker(worker, 1500)
@@ -452,6 +571,9 @@ class VersionPage(BasePage):
         def on_done(ok):
             dlg.accept()
             if ok:
+                from ...core.manifest import invalidate_scan_cache
+
+                invalidate_scan_cache()
                 self.info(f"{version_id} 安装完成。")
             else:
                 self.warn(
@@ -610,7 +732,14 @@ class VersionPage(BasePage):
 
         worker = Worker(work)
         worker.message.connect(dlg.set_stage)
-        worker.succeeded.connect(lambda vid: (dlg.accept(), self.info(f"已安装：{vid}")))
+        def on_loader_done(vid):
+            from ...core.manifest import invalidate_scan_cache
+
+            invalidate_scan_cache()
+            dlg.accept()
+            self.info(f"已安装：{vid}")
+
+        worker.succeeded.connect(on_loader_done)
         worker.failed.connect(dlg.done_with_error)
         dlg.cancelled.connect(worker.request_cancel)
         start_worker(self, worker, cancel_hook=manager.cancel)

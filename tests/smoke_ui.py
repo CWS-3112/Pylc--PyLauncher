@@ -23,7 +23,7 @@ from launcher.core.config import Config  # noqa: E402
 from launcher.ui.app import MainWindow  # noqa: E402
 from launcher.ui.theme import COLORS, apply_theme  # noqa: E402
 
-PAGES = ["home", "versions", "accounts", "mods", "settings"]
+PAGES = ["home", "versions", "accounts", "mods", "resources", "servers", "settings"]
 failures: list[str] = []
 
 
@@ -44,6 +44,7 @@ def main() -> int:
     apply_theme(app)
 
     window = MainWindow(config)
+    window.refresh_all()   # run() 之外使用时要手动补一次首屏刷新
     window.setWindowTitle("PyLauncher — 界面冒烟测试")
     window.show()
 
@@ -73,7 +74,8 @@ def main() -> int:
         check("样式表已加载", bool(app.styleSheet()))
         check("调色板页面底色生效", app.palette().window().color().name() == COLORS["bg"].lower())
         check("最小尺寸适配小屏", window.minimumWidth() >= 800, str(window.minimumWidth()))
-        check("快捷导航快捷键数量", len(window.nav_group.buttons()) == len(PAGES))
+        check("快捷导航快捷键数量", len(window.nav_group.buttons()) == len(PAGES),
+              f"{len(window.nav_group.buttons())} vs {len(PAGES)}")
         check("加载指示器存在", window.busy is not None)
 
         # —— 版本页三个标签可切换
@@ -138,7 +140,7 @@ def main() -> int:
     if failures:
         print(f"界面冒烟测试失败：{', '.join(failures)}")
         return 1
-    print(f"界面冒烟测试通过（{len(PAGES)} 个页面 + 快捷方式/主题检查全部正常）")
+    print(f"界面冒烟测试通过（{len(PAGES)} 个页面 + 联机/资源/快捷方式/主题检查全部正常）")
     return 0
 
 

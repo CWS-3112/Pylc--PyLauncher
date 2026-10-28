@@ -78,7 +78,6 @@ class LaunchOptions:
     fullscreen: bool = False
     extra_jvm_args: str = ""
     extra_game_args: str = ""
-    wrapper: str = ""
     custom_main_class: str = ""
     server_address: str = ""   # 预留：--server --port
     server_port: int = 25565
@@ -115,7 +114,6 @@ class LaunchOptions:
                 str(cfg.get("launch.extra_game_args", "") or ""),
                 instance.game_args,
             ])),
-            wrapper=instance.wrapper or str(cfg.get("launch.wrapper", "") or ""),
             custom_main_class=str(cfg.get("launch.custom_main_class", "") or ""),
             env=dict(instance.env or {}),
         )
@@ -445,10 +443,7 @@ def build_command(
     if not main_class:
         raise RuntimeError("无法确定主类（version.json 缺少 mainClass）")
 
-    cmd: List[str] = []
-    if options.wrapper:
-        cmd += shlex.split(options.wrapper)
-    cmd += [str(exe_path)]
+    cmd: List[str] = [str(exe_path)]
     cmd += [a for a in jvm if a]
     cmd += [main_class]
     cmd += game

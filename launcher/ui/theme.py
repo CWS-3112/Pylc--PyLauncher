@@ -204,6 +204,13 @@ QLabel[mono="true"] {{
     color: {COLORS['text_muted']};
     padding: 0px;
 }}
+#SidebarGroup {{
+    font-size: {FONT_SIZE['micro']}px;
+    font-weight: 600;
+    color: {COLORS['text_muted']};
+    padding: {SPACE['md']}px {SPACE['sm']}px 2px {SPACE['sm']}px;
+    letter-spacing: 1px;
+}}
 QPushButton[navButton="true"] {{
     background-color: transparent;
     border: none;

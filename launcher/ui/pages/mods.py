@@ -25,6 +25,8 @@ from ...core.mods import ModInfo, delete_mod, import_mods, scan_mods, set_mod_en
 from ..helpers import reveal_path
 from ..theme import METRICS, SPACE
 from ..widgets import Card, EmptyState, caption
+from ..anim import attach_tab_fade
+from ..workers import Worker, start_worker
 from .base import BasePage
 
 
@@ -34,6 +36,7 @@ class ModPage(BasePage):
     def __init__(self, main) -> None:
         super().__init__(main)
         self._mods: list[ModInfo] = []
+        self._online_hits: list = []
         self._build_ui()
         self.refresh()
 
@@ -103,13 +106,180 @@ class ModPage(BasePage):
             "点击「添加 Mod…」导入 .jar 文件，或直接把文件放进 Mod 目录后刷新。",
         )
         self.stack.addWidget(self.empty)
-        card.add(self.stack, 1)
+
+        # 已安装 / 在线下载 两个视图共用一个卡片，避免页面过长
+        from PySide6.QtWidgets import QTabWidget
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self.stack, "已安装")
+        self.tabs.addTab(self._build_online_tab(), "在线下载")
+        attach_tab_fade(self.tabs)
+        card.add(self.tabs, 1)
 
         self.summary = QLabel("")
         self.summary.setProperty("micro", True)
         self.summary.setWordWrap(True)
         card.add(self.summary)
         root.addWidget(card, 1)
+
+    # ---------------------------------------------------------------- 在线下载
+
+    def _build_online_tab(self) -> QWidget:
+        """Modrinth 在线模组库：搜索 → 选版本 → 下载到当前实例。"""
+        from PySide6.QtWidgets import QLineEdit, QProgressBar
+
+        from ..widgets import BusySpinner
+
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(SPACE["md"], SPACE["md"], SPACE["md"], SPACE["md"])
+        layout.setSpacing(SPACE["sm"])
+
+        bar = QHBoxLayout()
+        bar.setSpacing(SPACE["sm"])
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("搜索模组（如 jei、sodium）…")
+        self.search_edit.setMinimumHeight(METRICS["control_height"])
+        self.search_edit.returnPressed.connect(self._search_online)
+        bar.addWidget(self.search_edit, 1)
+
+        self.loader_combo = QComboBox()
+        self.loader_combo.setMinimumHeight(METRICS["control_height"])
+        self.loader_combo.addItem("不限加载器", "")
+        self.loader_combo.addItem("Fabric", "fabric")
+        self.loader_combo.addItem("Forge", "forge")
+        self.loader_combo.addItem("NeoForge", "neoforge")
+        bar.addWidget(self.loader_combo)
+
+        self.search_btn = QPushButton("搜索")
+        self.search_btn.setProperty("accent", True)
+        self.search_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.search_btn.clicked.connect(self._search_online)
+        bar.addWidget(self.search_btn)
+        layout.addLayout(bar)
+
+        self.online_spinner = BusySpinner(14)
+        self.online_hint = QLabel("输入关键词后回车即可搜索（数据源：Modrinth 官方接口）")
+        self.online_hint.setProperty("micro", True)
+        hint_row = QHBoxLayout()
+        hint_row.setSpacing(SPACE["xs"])
+        hint_row.addWidget(self.online_spinner)
+        hint_row.addWidget(self.online_hint, 1)
+        layout.addLayout(hint_row)
+
+        self.online_table = QTableWidget(0, 4)
+        self.online_table.setHorizontalHeaderLabels(["名称", "简介", "下载量", "操作"])
+        self.online_table.verticalHeader().setVisible(False)
+        self.online_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.online_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.online_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.online_table.setAlternatingRowColors(True)
+        self.online_table.verticalHeader().setDefaultSectionSize(METRICS["row_height"])
+        oh = self.online_table.horizontalHeader()
+        oh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        oh.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        oh.setFixedHeight(METRICS["header_height"])
+        for col in (0, 2, 3):
+            oh.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        layout.addWidget(self.online_table, 1)
+
+        self.online_progress = QProgressBar()
+        self.online_progress.setRange(0, 0)
+        self.online_progress.setVisible(False)
+        self.online_progress.setFixedHeight(16)
+        layout.addWidget(self.online_progress)
+        return page
+
+    def _search_online(self) -> None:
+        keyword = self.search_edit.text().strip()
+        loader = str(self.loader_combo.currentData() or "")
+        vid = str(self.version_combo.currentData() or "")
+        self.online_spinner.start()
+        self.online_hint.setText("正在搜索…")
+        self.search_btn.setEnabled(False)
+        self.online_table.setRowCount(0)
+
+        def work(on_progress, on_message, should_cancel=None):
+            from ...core import modrinth
+
+            return modrinth.search(keyword, kind="mod", loader=loader,
+                                   game_version=vid or "", limit=20)
+
+        def on_done(hits):
+            self.online_spinner.stop()
+            self.search_btn.setEnabled(True)
+            self._online_hits = hits
+            for hit in hits:
+                row = self.online_table.rowCount()
+                self.online_table.insertRow(row)
+                self.online_table.setItem(row, 0, QTableWidgetItem(hit.title))
+                self.online_table.setItem(row, 1, QTableWidgetItem(hit.description))
+                self.online_table.setItem(row, 2, QTableWidgetItem(f"{hit.downloads:,}"))
+
+                actions = QWidget()
+                actions.setObjectName("CellHost")
+                al = QHBoxLayout(actions)
+                al.setContentsMargins(2, 0, 2, 0)
+                al.setSpacing(SPACE["xs"])
+                install_btn = QPushButton("下载安装")
+                install_btn.setProperty("inTableCell", True)
+                install_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                install_btn.clicked.connect(lambda _=False, h=hit: self._install_online(h))
+                al.addWidget(install_btn)
+                self.online_table.setCellWidget(row, 3, actions)
+            self.online_hint.setText(
+                f"找到 {len(hits)} 个结果" if hits else "没有找到匹配的模组，试试换个关键词"
+            )
+
+        def on_error(message):
+            self.online_spinner.stop()
+            self.search_btn.setEnabled(True)
+            self.online_hint.setText(f"搜索失败：{message.splitlines()[0]}")
+            self.online_hint.setToolTip(message)
+
+        worker = Worker(work)
+        worker.succeeded.connect(on_done)
+        worker.failed.connect(on_error)
+        start_worker(self, worker)
+
+    def _install_online(self, hit) -> None:
+        """把选中的模组装进当前实例的 mods 目录。"""
+        directory = self._mods_dir()
+        if directory is None:
+            self.warn("请先安装并选择一个游戏版本")
+            return
+        vid = str(self.version_combo.currentData() or "")
+        loader = str(self.loader_combo.currentData() or "")
+        self.online_progress.setVisible(True)
+        self.main.set_busy(True, f"正在安装 {hit.title}…")
+
+        def work(on_progress, on_message, should_cancel=None):
+            from ...core import modrinth
+
+            file = modrinth.best_version(
+                hit.project_id,
+                loaders=[loader] if loader else [],
+                game_version=vid or "",
+            )
+            if file is None:
+                raise RuntimeError("该项目没有可下载的文件")
+            return modrinth.download_file(file, directory, base=directory)
+
+        def on_done(path):
+            self.online_progress.setVisible(False)
+            self.main.set_busy(False)
+            self.info(f"已安装：{path.name}\n重启游戏后生效。")
+            self._reload_table()
+
+        def on_error(message):
+            self.online_progress.setVisible(False)
+            self.main.set_busy(False)
+            self.error(f"安装失败：\n{message}")
+
+        worker = Worker(work)
+        worker.succeeded.connect(on_done)
+        worker.failed.connect(on_error)
+        start_worker(self, worker)
 
     # ---------------------------------------------------------------- 数据
 

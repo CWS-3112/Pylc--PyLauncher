@@ -6,7 +6,7 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import requests
@@ -54,7 +54,19 @@ class Session:
             self._close(resp)
 
     def request(self, method: str, url: str, **kwargs) -> requests.Response:
-        """发起请求，失败自动重试；`stream=True` 时调用方负责关闭。"""
+        """发起请求，失败自动重试；`stream=True` 时调用方负责关闭。
+
+        出站前先过软件防火墙（`core.netguard`）：非白名单域名、非 HTTPS、
+        解析到内网的地址都会被拒绝，避免被劫持的接口把启动器当成跳板。
+        """
+        from .netguard import guard
+
+        try:
+            guard.check_url(url)
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("请求被防火墙拦截：%s", exc)
+            raise
+
         last_err: Optional[Exception] = None
         stream = bool(kwargs.get("stream"))
         kwargs.setdefault("timeout", (CONNECT_TIMEOUT, self.timeout))
@@ -128,6 +140,10 @@ class Session:
 
 session = Session()
 
+# 版本清单是「点一下就要有反应」的交互，用更短的超时预算，
+# 避免默认 30s×3 次重试把界面拖成几分钟的转圈（用户会以为获取不到）。
+manifest_session = Session(timeout=15, retries=2)
+
 
 # -------------------------------------------------------------------- 源健康检查
 
@@ -135,6 +151,117 @@ session = Session()
 def other_mirror(mirror_key: str) -> str:
     """返回与给定源相对的另一个下载源。"""
     return "official" if mirror_key == DEFAULT_MIRROR else DEFAULT_MIRROR
+
+
+# 复用一个进程级线程池：每次调用都新建 ThreadPoolExecutor 会在退出时
+# 与解释器关闭竞争，日志里出现 "cannot schedule new futures after interpreter shutdown"。
+_POOL = None
+_POOL_LOCK = Lock()
+
+
+def _executor(max_workers: int = 4):
+    global _POOL
+    from concurrent.futures import ThreadPoolExecutor
+
+    with _POOL_LOCK:
+        if _POOL is None:
+            _POOL = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="pylauncher-io")
+    return _POOL
+
+
+def shutdown_io_pool(wait: bool = False) -> None:
+    """退出前调用：停止接受新任务（已提交的按 `wait` 决定是否等待）。"""
+    global _POOL
+    with _POOL_LOCK:
+        pool, _POOL = _POOL, None
+    if pool is not None:
+        try:
+            pool.shutdown(wait=wait, cancel_futures=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def probe_sources(mirror_keys: Sequence[str], timeout: float = 8.0) -> Dict[str, bool]:
+    """并发探测多个源：总耗时 = 最慢的那个，而不是逐个累加。
+
+    串行探测两个源要 1.7s（实测），并发后只花一次请求的时间。
+    """
+    keys = [k for k in mirror_keys if k in MIRRORS]
+    if not keys:
+        return {}
+    if len(keys) == 1:
+        return {keys[0]: probe_source(keys[0], timeout)}
+
+    results: Dict[str, bool] = {}
+    try:
+        pool = _executor(len(keys))
+        futures = {pool.submit(probe_source, k, timeout): k for k in keys}
+    except RuntimeError:
+        # 解释器已在关闭：退回串行，保证不抛
+        return {k: probe_source(k, timeout) for k in keys}
+
+    for fut in as_completed(futures):
+        key = futures[fut]
+        try:
+            results[key] = bool(fut.result())
+        except Exception:  # noqa: BLE001
+            results[key] = False
+    return results
+
+
+def fetch_first_json(
+    urls: Sequence[str],
+    sess: Optional["Session"] = None,
+    deadline: float = 20.0,
+) -> tuple:
+    """并发请求多个地址，取**最快成功**的那个。
+
+    串行回退时最坏要等所有源都超时（实测 1.7s，网络差时几十秒），
+    并发后只等最快的一个；全部失败则抛出最后一个错误。
+    """
+    urls = [u for u in urls if u]
+    if not urls:
+        raise RuntimeError("没有可用的下载地址")
+    if len(urls) == 1:
+        return get_json_with_fallback(urls, sess)
+
+    active = sess or session
+
+    errors: Dict[str, Exception] = {}
+    done: Dict[str, bool] = {}
+
+    def fetch(url: str):
+        try:
+            return url, active.get_json(url), None
+        except Exception as exc:  # noqa: BLE001
+            return url, None, exc
+
+    try:
+        pool = _executor(len(urls))
+        futures = [pool.submit(fetch, u) for u in urls]
+    except RuntimeError:
+        # 解释器关闭中：退回串行
+        return get_json_with_fallback(urls, sess)
+
+    waited = 0.0
+    while waited < deadline:
+        for fut in [f for f in futures if f.done()]:
+            if id(fut) in done:
+                continue
+            done[id(fut)] = True
+            url, data, err = fut.result()
+            if err is None and data is not None:
+                LOG.info("并发取源命中：%s", url)
+                return data, url
+            errors[url] = err or RuntimeError("空响应")
+        if len(done) == len(futures):
+            break
+        time.sleep(0.02)
+        waited += 0.02
+
+    last = list(errors.values())[-1] if errors else RuntimeError("全部地址均超时")
+    LOG.warning("所有地址都失败：%s", {u: str(e)[:60] for u, e in errors.items()})
+    raise last
 
 
 def probe_source(mirror_key: str, timeout: float = 8.0) -> bool:
@@ -171,23 +298,32 @@ def invalidate_source_cache() -> None:
 
 
 def available_mirror(preferred: str = "") -> str:
-    """返回实际可用的下载源：优先 `preferred`，不通则自动切到另一个。"""
+    """返回实际可用的下载源：优先 `preferred`，不通则自动切到另一个。
+
+    两个源**并发**探测，因此只花一次请求的时间。
+    """
     preferred = preferred or DEFAULT_MIRROR
-    if preferred in MIRRORS and probe_source(preferred):
-        return preferred
+    if preferred not in MIRRORS:
+        return DEFAULT_MIRROR
     backup = other_mirror(preferred)
-    if backup in MIRRORS and probe_source(backup):
+    results = probe_sources([preferred, backup])
+
+    # 缓存已被并发探测写入，这里直接读结果
+    if results.get(preferred):
+        return preferred
+    if results.get(backup):
         LOG.warning("下载源 %s 不可用，已自动切换到 %s", preferred, backup)
         return backup
     return preferred
 
 
-def get_json_with_fallback(urls: Sequence[str]) -> tuple:
+def get_json_with_fallback(urls: Sequence[str], sess: Optional["Session"] = None) -> tuple:
     """依次尝试多个地址，返回 `(数据, 实际使用的地址)`；全部失败则抛出最后一个异常。"""
+    active = sess or session
     last: Optional[Exception] = None
     for url in urls:
         try:
-            return session.get_json(url), url
+            return active.get_json(url), url
         except Exception as exc:  # noqa: BLE001
             last = exc
             LOG.warning("请求失败，尝试下一个源：%s", exc)

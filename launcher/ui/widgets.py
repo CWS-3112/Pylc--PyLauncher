@@ -276,12 +276,49 @@ class EmptyState(QWidget):
         self._action_row.addStretch(1)
         inner_layout.addLayout(self._action_row)
 
+        # 加载中占位：任何「要等」的列表都必须先给反馈，否则就是白屏
+        self._loading_row = QHBoxLayout()
+        self._loading_row.setContentsMargins(0, SPACE["md"], 0, 0)
+        self._loading_row.setSpacing(SPACE["sm"])
+        self._loading_row.addStretch(1)
+        self.spinner = BusySpinner(16)
+        self.loading_label = QLabel("加载中…")
+        self.loading_label.setProperty("muted", True)
+        self._loading_row.addWidget(self.spinner)
+        self._loading_row.addWidget(self.loading_label)
+        self._loading_row.addStretch(1)
+        self.spinner.setVisible(False)
+        self.loading_label.setVisible(False)
+        inner_layout.addLayout(self._loading_row)
+
         layout.addWidget(inner, 0, Qt.AlignmentFlag.AlignCenter)
 
     def set_text(self, title: str, description: str = "") -> None:
         self.title_label.setText(title)
         self.desc_label.setText(description)
         self.desc_label.setVisible(bool(description))
+
+    def set_loading(self, text: str = "加载中…") -> None:
+        """显示「正在加载」反馈；传空串表示结束。"""
+        on = bool(text)
+        self.spinner.setVisible(on)
+        self.loading_label.setVisible(on)
+        if on:
+            self.loading_label.setText(text)
+            self.spinner.start()
+        else:
+            self.spinner.stop()
+
+    def set_action(self, action) -> None:
+        """替换（或设置）底部操作按钮，用于「失败后重试」。"""
+        while self._action_row.count() > 2:      # 前后各一个 stretch
+            item = self._action_row.takeAt(1)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        if action is not None:
+            self._action_row.insertWidget(1, action)
 
 
 # -------------------------------------------------------------------- 路径选择

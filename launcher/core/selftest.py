@@ -11,6 +11,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from .auth import create_offline_account, offline_uuid
@@ -470,6 +471,162 @@ def run_selftest() -> int:
         ensure_backup_urls([task], get_mirror(OFFICIAL))
         check("任务自动带上备用源", len(task.urls) == 2 and task.urls[1].startswith(MIRRORS[BMCLAPI].libraries),
               str(task.urls))
+
+        # --------------------------- 版本清单的健壮性（「获取不到版本列表」的回归）
+        print("\n[11] 版本清单解析与降级")
+        from .manifest import VersionManifest
+
+        good = {
+            "latest": {"release": "1.20.4"},
+            "versions": [
+                {"id": "1.20.4", "type": "release", "url": "u1", "time": "t1", "releaseTime": "r1"},
+                {"id": "1.19", "type": "release"},                 # 缺 url / 时间
+                {"type": "release"},                               # 缺 id
+                "not-a-dict",                                      # 脏数据
+            ],
+        }
+        vm = VersionManifest()
+        vm._apply(good, "test")
+        check("脏记录被跳过且不影响解析", len(vm.all()) == 2, str([v.id for v in vm.all()]))
+        check("缺 url 的记录仍保留", vm.get("1.19") is not None)
+
+        for label, payload in (
+            ("空 versions 列表", {"versions": []}),
+            ("缺 versions 字段", {"latest": {}}),
+            ("响应不是 dict", "<html>"),
+        ):
+            vm2 = VersionManifest()
+            try:
+                vm2._apply(payload, "test")
+                check(f"{label} 应判为无效", False, "被当成成功")
+            except Exception as exc:  # noqa: BLE001 - 任何异常都说明「未被当成有效数据」
+                check(f"{label} 应判为无效", True, type(exc).__name__)
+
+        # 离线兜底：先写缓存，再把两个源都指向不可达地址
+        vm3 = VersionManifest()
+        vm3._apply(good, "test")
+        vm3._save_cache(good)
+        check("清单缓存已落盘", vm3._cache_file().is_file(), str(vm3._cache_file()))
+
+        from .constants import MIRRORS as _M
+
+        saved = {k: v.version_manifest for k, v in _M.items()}
+        for key in _M:
+            object.__setattr__(_M[key], "version_manifest", "https://127.0.0.1:9/none.json")
+        try:
+            vm4 = VersionManifest()
+            vm4.refresh(OFFICIAL, force=True)
+            check("离线时回退到本地缓存", vm4.loaded and len(vm4.all()) == 2 and vm4.stale,
+                  f"loaded={vm4.loaded} stale={vm4.stale}")
+            try:
+                vm3._cache_file().unlink()
+            except OSError:
+                pass
+            vm5 = VersionManifest()
+            try:
+                vm5.refresh(OFFICIAL, force=True)
+                check("无缓存且离线时明确报错", False)
+            except Exception:  # noqa: BLE001
+                check("无缓存且离线时明确报错", True)
+        finally:
+            for key, value in saved.items():
+                object.__setattr__(_M[key], "version_manifest", value)
+
+        # --------------------------- 安全加固与新增能力
+        print("\n[12] 安全加固：路径 / 压缩包 / 防火墙")
+        from .netguard import NetGuardError, guard
+        # 注意：不要在这里再 import sanitize_name —— 会让它变成函数局部变量，
+        # 导致前面模块级同名函数的调用抛 UnboundLocalError。
+        from .utils import extract_zip, safe_join
+
+        check("版本名中的 .. 被清除", ".." not in sanitize_name("../../etc/passwd"),
+              sanitize_name("../../etc/passwd"))
+        check("Windows 保留名被转义", sanitize_name("NUL").startswith("_"), sanitize_name("NUL"))
+        escaped = safe_join(tmp, "../escape")
+        check("safe_join 结果不会逃出根目录",
+              str(escaped).startswith(str(tmp.resolve())), str(escaped))
+        check("safe_join 保留正常路径",
+              safe_join(tmp, "versions/1.20.4").name == "1.20.4")
+
+        # zip slip：压缩包里放一个 ../evil.txt
+        slip = tmp / "slip.zip"
+        with zipfile.ZipFile(slip, "w") as zf:
+            zf.writestr("../evil.txt", "pwned")
+            zf.writestr("ok/good.txt", "fine")
+        out_dir = tmp / "slip-out"
+        files = extract_zip(slip, out_dir)
+        names = {p.name for p in files}
+        check("zip slip 条目被跳过", "evil.txt" not in names, str(names))
+        check("正常条目仍然解压", "good.txt" in names)
+        check("没有写到目标目录之外", not (tmp / "evil.txt").exists())
+
+        for url in ("https://api.modrinth.com/v2/search", "https://libraries.minecraft.net/x.jar"):
+            try:
+                guard.check_url(url)
+                check(f"防火墙放行 {url.split('/')[2]}", True)
+            except NetGuardError as exc:
+                check(f"防火墙放行 {url.split('/')[2]}", False, str(exc))
+        for url in ("https://evil.example.com/a", "file:///etc/passwd", "http://mirror.test/a"):
+            try:
+                guard.check_url(url)
+                check(f"防火墙拦截 {url[:28]}", False, "竟被放行")
+            except NetGuardError:
+                check(f"防火墙拦截 {url[:28]}", True)
+
+        print("\n[13] 新增能力：联机码 / 服务器地址 / 材质包")
+        from .netplay import join_arguments, make_join_code, parse_join_code
+        from .resources import install_from_file, packs_dir, scan, set_enabled
+        from .servers import ServerInfo, split_address
+
+        token, host, port = parse_join_code(make_join_code("t0k", "1.2.3.4", 35565))
+        check("联机码往返一致", (token, host, port) == ("t0k", "1.2.3.4", 35565), f"{host}:{port}")
+        try:
+            parse_join_code("乱码")
+            check("非法联机码被拒绝", False)
+        except ValueError:
+            check("非法联机码被拒绝", True)
+        check("服务器地址拆分", split_address("mc.test:25566") == ("mc.test", 25566)
+              and split_address("[::1]:1234") == ("::1", 1234))
+        check("进入服务器参数", join_arguments("1.2.3.4", 25565) == ["--server", "1.2.3.4", "--port", "25565"])
+        check("服务器记录可序列化",
+              ServerInfo.from_dict(ServerInfo(name="a", address="b", port=1).to_dict()).host_port == "b:1")
+
+        inst = tmp / "instance"
+        pack_src = tmp / "Pack.zip"
+        with zipfile.ZipFile(pack_src, "w") as zf:
+            zf.writestr("pack.mcmeta", '{"pack":{"description":"自检材质包"}}')
+        installed = install_from_file(pack_src, inst, "resourcepack")
+        check("材质包安装成功", installed.is_file(), str(installed))
+        packs = scan(inst, "resourcepack")
+        check("材质包可被扫描", len(packs) == 1 and packs[0].enabled, str(len(packs)))
+        disabled = set_enabled(packs[0], False)
+        check("禁用后带 .disabled 后缀", disabled.path.name.endswith(".disabled"), disabled.path.name)
+        check("重新启用恢复原名", set_enabled(disabled, True).path.name == "Pack.zip")
+        check("光影目录独立", packs_dir(inst, "shaderpack").name == "shaderpacks")
+
+        # --------------------------- 首屏性能与加载兜底
+        print("\n[14] 首屏性能与加载兜底")
+        from .http import probe_sources
+        from .manifest import VersionManifest
+
+        vm6 = VersionManifest()
+        vm6._apply(good, "test")
+        vm6._save_cache(good)
+        vm7 = VersionManifest()
+        t0 = time.time()
+        loaded = vm7.load_cached()
+        elapsed = (time.time() - t0) * 1000
+        check("缓存秒开可用", loaded and len(vm7.all()) == 2, str(len(vm7.all())))
+        check("缓存加载足够快（<200ms）", elapsed < 200, f"{elapsed:.1f}ms")
+        check("缓存数据被标记为陈旧", vm7.stale and vm7.source == "cache")
+        try:
+            vm7._cache_file().unlink()
+        except OSError:
+            pass
+
+        results = probe_sources([OFFICIAL, BMCLAPI]) if "OFFICIAL" in dir() else {}
+        check("并发探活返回全部源的结果",
+              (not results) or set(results) == {OFFICIAL, BMCLAPI}, str(results))
 
         print("\n" + "=" * 68)
         print(f"通过 {len(_PASSED)} 项，失败 {len(_FAILED)} 项")

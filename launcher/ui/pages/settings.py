@@ -167,8 +167,6 @@ class SettingsPage(BasePage):
         self.log_cb = QCheckBox("启动时显示日志窗口")
         for cb in (self.visible_cb, self.log_cb):
             cb.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.wrapper_edit = QLineEdit()
-        self.wrapper_edit.setPlaceholderText("留空；例如 Linux 上可填 gamemoderun / primusrun")
         self.jvm_args_edit = QTextEdit()
         self.jvm_args_edit.setFixedHeight(64)
         self.jvm_args_edit.setPlaceholderText("额外 JVM 参数，例如：\n-Dfml.ignoreInvalidMinecraftCertificates=true")
@@ -178,7 +176,6 @@ class SettingsPage(BasePage):
 
         lform.addRow("", self.visible_cb)
         lform.addRow("", self.log_cb)
-        lform.addRow("包装命令：", self.wrapper_edit)
         lform.addRow("额外 JVM 参数：", self.jvm_args_edit)
         lform.addRow("额外游戏参数：", self.game_args_edit)
         launch_card.add_layout(lform)
@@ -187,6 +184,9 @@ class SettingsPage(BasePage):
         # ---------------- 桌面快捷方式
         self.shortcut_card = self._build_shortcut_card()
         layout.addWidget(self.shortcut_card)
+
+        # ---------------- 网络安全（防火墙）
+        layout.addWidget(self._build_security_card())
 
         # ---------------- 微软登录
         ms_card = Card("微软登录（正版）", subtitle="本启动器不内置任何第三方 Client ID，需自行注册 Azure 应用")
@@ -331,6 +331,63 @@ class SettingsPage(BasePage):
         self.config.set("shortcut.auto_create", enabled)
         hint = "下次启动时生效。" if enabled else "不再自动创建，可随时手动点击上方按钮。"
         self.flash(f"已{'开启' if enabled else '关闭'}自动创建桌面快捷方式 · {hint}")
+
+    def _build_security_card(self) -> Card:
+        """软件防火墙：域名白名单与下载约束的可视化入口。"""
+        from ...core.netguard import guard
+
+        card = Card("网络安全（防火墙）", subtitle="所有下载请求与写盘操作都会经过这一层检查")
+        count, max_bytes = guard.describe()
+
+        row = QHBoxLayout()
+        row.setSpacing(SPACE["md"])
+        self.security_badge = Badge(f"白名单 {count} 个域名", "success")
+        row.addWidget(self.security_badge)
+        self.security_label = QLabel(
+            f"仅允许 HTTPS（或明确放行的内网地址）· 单文件上限 {max_bytes // (1024 * 1024)} MB"
+        )
+        self.security_label.setProperty("micro", True)
+        self.security_label.setWordWrap(True)
+        row.addWidget(self.security_label, 1)
+        card.add_layout(row)
+
+        form = QHBoxLayout()
+        form.setSpacing(SPACE["md"])
+        self.trust_edit = QLineEdit()
+        self.trust_edit.setPlaceholderText("要额外放行的域名，如 mirror.example.com")
+        self.trust_edit.setMinimumHeight(METRICS["control_height"])
+        form.addWidget(self.trust_edit, 1)
+        self.trust_btn = QPushButton("添加信任")
+        self.trust_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.trust_btn.clicked.connect(self._add_trusted_host)
+        form.addWidget(self.trust_btn)
+        card.add_layout(form)
+
+        hint = QLabel(
+            "启动器默认只访问 Mojang / 官方镜像 / Modrinth / Fabric / Forge 等域名；"
+            "下载目标路径会被限制在游戏目录内，压缩包还会拦截 zip slip 与压缩包炸弹。"
+        )
+        hint.setProperty("micro", True)
+        hint.setWordWrap(True)
+        card.add(hint)
+        return card
+
+    def _add_trusted_host(self) -> None:
+        from ...core.netguard import guard
+
+        host = self.trust_edit.text().strip().lower()
+        if not host:
+            self.warn("请输入要放行的域名")
+            return
+        host = host.split("//")[-1].split("/")[0]
+        if not host or "." not in host:
+            self.warn("域名格式不正确，示例：mirror.example.com")
+            return
+        guard.add_host(host)
+        self.trust_edit.clear()
+        count, _ = guard.describe()
+        self.security_badge.set_state(f"白名单 {count} 个域名", "success")
+        self.flash(f"已放行 {host}")
 
     def _refresh_shortcut_state(self) -> None:
         try:
@@ -487,8 +544,9 @@ class SettingsPage(BasePage):
         idx = self.mirror_combo.findData(str(cfg.get("mirror", BMCLAPI)))
         self.mirror_combo.setCurrentIndex(max(0, idx))
 
-        self._javas = find_java()
-        self._reload_java_combo()
+        # Java 探测要启动子进程（实测约 0.6s），放到后台做，界面先显示「检测中」。
+        # 这是打开设置页会明显卡一下的直接原因。
+        self._detect_java_async()
 
         self.auto_mem_cb.setChecked(bool(cfg.get("memory.auto", True)))
         self.max_mem.setValue(int(cfg.get("memory.max_mb", 4096)))
@@ -504,7 +562,6 @@ class SettingsPage(BasePage):
 
         self.visible_cb.setChecked(bool(cfg.get("launch.launcher_visible", True)))
         self.log_cb.setChecked(bool(cfg.get("launch.show_log_window", True)))
-        self.wrapper_edit.setText(str(cfg.get("launch.wrapper", "") or ""))
         self.jvm_args_edit.setPlainText(str(cfg.get("launch.extra_jvm_args", "") or ""))
         self.game_args_edit.setPlainText(str(cfg.get("launch.extra_game_args", "") or ""))
 
@@ -531,11 +588,34 @@ class SettingsPage(BasePage):
                 idx = self.java_combo.count() - 1
             self.java_combo.setCurrentIndex(idx)
         self.java_combo.blockSignals(False)
+        best = max((j.major for j in self._javas), default=0)
         self.java_hint.setText(
-            f"共检测到 {len(self._javas)} 个 Java。1.18+ 需要 Java 17，1.20.5+ 需要 Java 21。"
+            f"共检测到 {len(self._javas)} 个 Java，最高 Java {best}。"
+            "实际所需版本以每个版本 JSON 的 javaVersion 为准（启动前会自动核对）。"
         )
 
     # ---------------------------------------------------------------- Java
+
+    def _detect_java_async(self) -> None:
+        """后台检测 Java：不阻塞页面构建，完成后只更新下拉框。"""
+        self._javas = self._javas or []
+        self.java_hint.setText("正在检测 Java 运行环境…")
+        self.java_combo.blockSignals(True)
+        self.java_combo.clear()
+        self.java_combo.addItem("检测中…", "")
+        self.java_combo.blockSignals(False)
+
+        def work(on_progress, on_message, should_cancel=None):
+            return find_java()
+
+        def done(javas):
+            self._javas = javas
+            self._reload_java_combo()
+
+        worker = Worker(work)
+        worker.succeeded.connect(done)
+        worker.failed.connect(lambda m: self.java_hint.setText(f"Java 检测失败：{m.splitlines()[0]}"))
+        start_worker(self, worker)
 
     def _detect_java(self) -> None:
         dlg = ProgressDialog("检测 Java", self, cancelable=False)
@@ -604,7 +684,6 @@ class SettingsPage(BasePage):
         cfg.set("window.height", self.height_spin.value())
         cfg.set("launch.launcher_visible", self.visible_cb.isChecked())
         cfg.set("launch.show_log_window", self.log_cb.isChecked())
-        cfg.set("launch.wrapper", self.wrapper_edit.text().strip())
         cfg.set("launch.extra_jvm_args", self.jvm_args_edit.toPlainText().strip())
         cfg.set("launch.extra_game_args", self.game_args_edit.toPlainText().strip())
         cfg.set("microsoft.client_id", self.client_id_edit.text().strip())

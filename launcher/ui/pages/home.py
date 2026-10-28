@@ -379,7 +379,30 @@ class HomePage(BasePage):
             self.main.set_busy(False)
             self._sync_launch_button()
 
-    def _do_launch(self, vid, account, ins, game_dir) -> None:  # noqa: C901 - 启动前检查
+    def launch_into_server(self, host: str, port: int) -> None:
+        """供「服务器与联机」页调用：以当前版本与账户直接进入指定服务器。"""
+        vid = self._current_version_id()
+        if not vid:
+            self.warn("请先在首页安装并选择一个游戏版本")
+            return
+        account = self._current_account()
+        if account is None:
+            self.warn("请先添加并选择一个账户")
+            return
+
+        ins = self.config.get_instance(vid, create=True)
+        game_dir = self.game_dir()
+        self._launching = True
+        self.launch_btn.set_busy(True, f"正在进入 {host}…")
+        self.main.set_busy(True, f"正在进入 {host}:{port}…")
+        try:
+            self._do_launch(vid, account, ins, game_dir, server=(host, port))
+        finally:
+            self._launching = False
+            self.main.set_busy(False)
+            self._sync_launch_button()
+
+    def _do_launch(self, vid, account, ins, game_dir, server=None) -> None:  # noqa: C901 - 启动前检查
         try:
             resolved = resolve_version(game_dir, vid, ins)
         except Exception as exc:  # noqa: BLE001
@@ -393,6 +416,9 @@ class HomePage(BasePage):
             return
 
         options = LaunchOptions.from_instance(ins, self.config, account)
+        if server:
+            options.server_address = str(server[0])
+            options.server_port = int(server[1])
         javas = find_java()
         java = resolve_java(options.java_path, resolved.java_required, javas)
         if java is None:
@@ -445,6 +471,8 @@ class HomePage(BasePage):
             proc, cmd, resolved, java_info = launch(
                 game_dir, options, ins, on_log, on_exit
             )
+            if server:
+                LOGGER.info("以服务器模式启动：%s:%s", server[0], server[1])
         except Exception as exc:  # noqa: BLE001
             LOGGER.exception("启动游戏失败")
             self.error(f"启动失败：\n{exc}")

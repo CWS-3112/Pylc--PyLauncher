@@ -80,6 +80,7 @@ def main() -> int:
     app = QApplication(sys.argv[:1])
     apply_theme(app)
     window = MainWindow(config)
+    window.refresh_all()   # run() 之外使用时要手动补一次首屏刷新
     window.resize(1120, 760)
     window.show()
     app.processEvents()

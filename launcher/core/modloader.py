@@ -340,3 +340,6 @@ def uninstall_version(game_dir: Path, version_id: str) -> None:
     if target.is_dir():
         shutil.rmtree(target, ignore_errors=True)
         LOG.info("已删除版本：%s", version_id)
+        from .manifest import invalidate_scan_cache
+
+        invalidate_scan_cache()
