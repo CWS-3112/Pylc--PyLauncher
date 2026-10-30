@@ -1,6 +1,6 @@
 # PyLauncher
 
-一个功能对标 HMCL（Hello Minecraft! Launcher）的《我的世界》**Java 版**启动器，  
+《我的世界》**Java 版**启动器，  
 使用 **Python + PySide6** 编写，跨 Windows / macOS / Linux。当前版本 **1.0.0**。
 
 代码按「核心层 / 界面层」严格分离，`launcher/core` 不依赖任何 GUI 组件，  
