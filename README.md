@@ -1,4 +1,4 @@
-# PyLauncher
+# Pycl (PyLauncher)
 
 《我的世界》**Java 版**启动器，  
 使用 **Python + PySide6** 编写，跨 Windows / macOS / Linux。当前版本 **1.0.0**。
